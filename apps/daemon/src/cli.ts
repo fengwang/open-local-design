@@ -232,9 +232,9 @@ const AMR_STRING_FLAGS = new Set(['daemon-url']);
 const AMR_BOOLEAN_FLAGS = new Set(['help', 'h', 'json', 'refresh']);
 const COLLAB_STRING_FLAGS = new Set([
   'daemon-url', 'project', 'member', 'name', 'role', 'client-id', 'sequence', 'design-system',
-  'workspace', 'workspace-member',
+  'workspace', 'workspace-member', 'version',
 ]);
-const COLLAB_BOOLEAN_FLAGS = new Set(['help', 'h', 'json']);
+const COLLAB_BOOLEAN_FLAGS = new Set(['help', 'h', 'json', 'dont-prompt-24h']);
 const MESSAGE_CENTER_STRING_FLAGS = new Set([
   'daemon-url',
   'locale',
@@ -259,6 +259,7 @@ const PROJECT_RESOURCE_STRING_FLAGS = new Set([
 ]);
 const PROJECT_BOOLEAN_FLAGS = new Set(['help', 'h', 'json', 'follow', 'thumbnail']);
 const WORKSPACE_STRING_FLAGS = new Set([
+  'model',
   'daemon-url', 'workspace', 'view', 'visibility', 'owner', 'project',
   'member', 'role', 'email', 'app-user', 'lifecycle-state',
   'member-status', 'can-share-projects', 'can-write-synced-files',
@@ -1223,6 +1224,10 @@ function printCollabHelp() {
   od collab publish <projectId> --workspace <id> --workspace-member <id> [--json]
   od collab share <projectId> --workspace <id> --workspace-member <id> [--json]
   od collab pull <projectId> --workspace <id> --workspace-member <id> [--json]
+  od collab check <projectId> --workspace <id> --workspace-member <id> [--json]
+  od collab accept <projectId> --version <n> [--dont-prompt-24h] --workspace <id> --workspace-member <id> [--json]
+  od collab dismiss <projectId> --version <n> [--dont-prompt-24h] --workspace <id> --workspace-member <id> [--json]
+  od collab ask-again <projectId> --workspace <id> --workspace-member <id> [--json]
   od collab share-resource <design-systems|plugins|skills> <id> --workspace <id> --workspace-member <id> [--json]
   od collab team-resources <design-systems|plugins|skills> --workspace <id> --workspace-member <id> [--json]
   od collab share-design-system <designSystemId> --workspace <id> --workspace-member <id> [--json]
@@ -1389,6 +1394,32 @@ async function runCollab(args) {
   };
 
   switch (sub) {
+    case 'check':
+    case 'accept':
+    case 'dismiss':
+    case 'ask-again': {
+      const version = flags.version === undefined ? undefined : Number(flags.version);
+      if ((sub === 'accept' || sub === 'dismiss') && (version == null || !Number.isSafeInteger(version) || version < 0)) {
+        console.error('pass --version <n> naming the offered cloud version');
+        process.exit(2);
+      }
+      const body = await request('POST', '/collab/update', {
+        action: sub === 'ask-again' ? 'reset-preference' : sub,
+        ...(version !== undefined ? { version } : {}),
+        ...(sub === 'check' ? { manual: true } : {}),
+        ...(sub === 'accept' || sub === 'dismiss' ? { dontPromptFor24h: Boolean(flags['dont-prompt-24h']) } : {}),
+      });
+      emit(body, () => {
+        const update = body.update;
+        console.log(`state\t${update?.state ?? '-'}`);
+        console.log(`latestVersion\t${update?.latestVersion ?? '-'}`);
+        console.log(`localVersion\t${update?.localVersion ?? '-'}`);
+        console.log(`promptSuppressedUntil\t${update?.promptSuppressedUntil ?? '-'}`);
+        if (update?.state === 'confirmation_required') console.log('The cloud version replaces local project content. HTML history can be recovered; other overwritten files may be lost. Use od collab accept --version <n> to approve.');
+      });
+      if (['failed', 'busy', 'unsupported'].includes(body.update?.state)) process.exitCode = 3;
+      return;
+    }
     case 'status': {
       const body = await request('GET', '/collab/status');
       return emit(body, () => {
@@ -1818,6 +1849,10 @@ async function runMediaGenerate(rawArgs) {
     console.error(err.message);
     printMediaHelp();
     process.exit(2);
+  }
+  if (flags.help || flags.h) {
+    printMediaHelp();
+    return;
   }
 
   const daemonUrl = await cliDaemonUrl(flags);
@@ -7222,6 +7257,23 @@ Common options:
             data:    data.error.data,
           });
         }
+        // The daemon bounds create preparation (15s by default) and answers
+        // 504 PROJECT_CREATE_PREPARATION_TIMEOUT without committing anything.
+        // Surface that code the same way the Web does so an embedding agent
+        // can retry the identical request instead of parsing a log line.
+        if (flags.json && typeof data?.error?.code === 'string') {
+          return exitWithStructuredError({
+            code:    data.error.code,
+            message: typeof data.error.message === 'string'
+              ? data.error.message
+              : `POST /api/projects failed: ${resp.status}`,
+            data:    {
+              status:    resp.status,
+              retryable: data.error.retryable === true,
+              ...(data.error.details !== undefined ? { details: data.error.details } : {}),
+            },
+          });
+        }
         console.error(`POST /api/projects failed: ${resp.status} ${JSON.stringify(data)}`);
         process.exit(1);
       }
@@ -7485,7 +7537,7 @@ async function runWorkspace(args) {
   od workspace projects batch-delete --workspace <id> --member <id> --project <id> [--project <id> ...] [--json]
   od workspace projects batch-move --workspace <id> --member <id> --visibility personal|team --project <id> [--project <id> ...] [--json]
   od workspace members list --workspace <id> --member <id> [--json]
-  od workspace billing [--workspace-type personal|team --workspace <id>] [--json]
+  od workspace billing [--workspace-type personal|team --workspace <id>] [--model <id>] [--json]
 
 Common options:
   --daemon-url <url>   OpenDesign daemon HTTP base.
@@ -7565,16 +7617,17 @@ Common options:
     if (
       (workspaceType && workspaceType !== 'personal' && workspaceType !== 'team') ||
       (workspaceType && !workspaceId) ||
-      (!workspaceType && workspaceId)
+      (!workspaceType && workspaceId) ||
+      (flags.model && !workspaceId)
     ) {
       console.error(
-        'Usage: od workspace billing [--workspace-type personal|team --workspace <id>] [--json]',
+        'Usage: od workspace billing [--workspace-type personal|team --workspace <id>] [--model <id>] [--json]',
       );
       process.exit(2);
     }
     const billingPath =
       workspaceType
-        ? `/api/workspace/billing?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}`
+        ? `/api/workspace/billing?scope=workspace&workspaceId=${encodeURIComponent(workspaceId)}&includePreflight=1${typeof flags.model === 'string' ? `&modelId=${encodeURIComponent(flags.model)}` : ''}`
         : '/api/workspace/billing?scope=account';
     const data = await workspaceContextRequest(billingPath);
     if (flags.json) return process.stdout.write(JSON.stringify(data, null, 2) + '\n');
@@ -7593,6 +7646,12 @@ Common options:
       console.log(`Account credits:\t${summary.totalAvailableCredits}`);
       console.log(`  Account plan credits:\t${summary.subscriptionCredits}`);
       console.log(`  Account top-up credits:\t${summary.rechargeCredits}`);
+    }
+    if (data?.preflight) {
+      console.log(`Expected funding: ${data.preflight.funding} (gateway decides final admission)`);
+      for (const window of data.preflight.codingPlan.windows) {
+        console.log(`Coding Plan ${window.durationSeconds}s: ${window.remainingCredits}/${window.limitCredits} credits remaining; resets ${window.resetsAt ?? 'not started yet'}`);
+      }
     }
     const balanceUsd = workspaceBalance?.balanceUsd ?? summary?.balanceUsd;
     if (balanceUsd != null) {
@@ -11319,13 +11378,11 @@ function splitCommaSeparatedIds(value) {
   return out;
 }
 
-const splitAutomationIds = splitCommaSeparatedIds;
-
 function automationContextFromFlags(flags) {
-  const skillIds = splitAutomationIds(flags.skill);
-  const pluginIds = splitAutomationIds(flags.plugin);
-  const mcpServerIds = splitAutomationIds(flags.mcp);
-  const connectorIds = splitAutomationIds(flags.connector);
+  const skillIds = splitCommaSeparatedIds(flags.skill);
+  const pluginIds = splitCommaSeparatedIds(flags.plugin);
+  const mcpServerIds = splitCommaSeparatedIds(flags.mcp);
+  const connectorIds = splitCommaSeparatedIds(flags.connector);
   const context = {
     ...(skillIds.length > 0 ? { skillIds } : {}),
     ...(pluginIds.length > 0 ? { pluginIds } : {}),
@@ -11861,7 +11918,7 @@ async function runAutomation(args) {
         enabled: !flags.disabled,
       };
       const context = automationContextFromFlags(flags);
-      const skillIds = splitAutomationIds(flags.skill);
+      const skillIds = splitCommaSeparatedIds(flags.skill);
       if (skillIds.length > 0) body.skillId = skillIds[0];
       if (context) body.context = context;
       if (flags.agent) body.agentId = String(flags.agent);
@@ -11912,7 +11969,7 @@ async function runAutomation(args) {
       if (flags.enabled) patch.enabled = true;
       const context = automationContextFromFlags(flags);
       if (context) {
-        const skillIds = splitAutomationIds(flags.skill);
+        const skillIds = splitCommaSeparatedIds(flags.skill);
         if (skillIds.length > 0) patch.skillId = skillIds[0];
         patch.context = context;
       }

@@ -1,7 +1,7 @@
 import { symlinkSync } from 'node:fs';
 import { test, vi } from 'vitest';
 import { homedir } from 'node:os';
-import { dirname, relative, resolve } from 'node:path';
+import { delimiter, dirname, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as platform from '@open-design/platform';
 import {
@@ -509,6 +509,49 @@ test('resolveAgentExecutable supports configured binary overrides for non-Codex 
 
         assert.equal(resolved, configured, `expected ${id} to use ${envKey}`);
       }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('resolveAgentExecutable prefers a direct Copilot CLI over the VS Code bootstrapper', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'od-copilot-bin-order-'));
+  try {
+    return withEnvSnapshot(['PATH', 'PATHEXT', 'OD_AGENT_HOME'], () => {
+      const vscodeDir = join(
+        dir,
+        'Code',
+        'User',
+        'globalStorage',
+        'github.copilot-chat',
+        'copilotCli',
+      );
+      const npmDir = join(dir, 'npm');
+      mkdirSync(vscodeDir, { recursive: true });
+      mkdirSync(npmDir, { recursive: true });
+      const windows = process.platform === 'win32';
+      const vscodeBootstrap = join(vscodeDir, windows ? 'copilot.BAT' : 'copilot');
+      const directCli = join(npmDir, windows ? 'copilot.CMD' : 'copilot');
+      writeFileSync(vscodeBootstrap, windows ? '@exit /b 0\n' : '#!/bin/sh\nexit 0\n');
+      writeFileSync(directCli, windows ? '@exit /b 0\n' : '#!/bin/sh\nexit 0\n');
+      if (!windows) {
+        chmodSync(vscodeBootstrap, 0o755);
+        chmodSync(directCli, 0o755);
+      }
+      process.env.PATH = [vscodeDir, npmDir].join(delimiter);
+      process.env.PATHEXT = '.EXE;.BAT;.CMD';
+      process.env.OD_AGENT_HOME = dir;
+
+      assert.equal(
+        resolveAgentExecutable(minimalAgentDef({ id: 'copilot', bin: 'copilot' })),
+        directCli,
+      );
+      rmSync(directCli);
+      assert.equal(
+        resolveAgentExecutable(minimalAgentDef({ id: 'copilot', bin: 'copilot' })),
+        vscodeBootstrap,
+      );
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -1577,4 +1620,37 @@ test('spawnEnvForAgent preserves a configured MIMOCODE_DISABLE_PROJECT_CONFIG ov
 
   assert.equal(env.MIMOCODE_DISABLE_PROJECT_CONFIG, '0');
   assert.equal(env.PATH, '/usr/bin');
+});
+
+// #8093: persistence alone is half the contract — the saved key has to reach
+// the pi process, or an isolated config directory is still not isolated.
+test('spawnEnvForAgent carries a configured PI_CODING_AGENT_DIR through to pi', () => {
+  const env = spawnEnvForAgent(
+    'pi',
+    {
+      PATH: '/usr/bin',
+    },
+    {
+      PI_BIN: '/Users/test/bin/pi',
+      PI_CODING_AGENT_DIR: '/Users/test/.pi-isolated/agent',
+    },
+  );
+
+  assert.equal(env.PI_CODING_AGENT_DIR, '/Users/test/.pi-isolated/agent');
+  assert.equal(env.PI_BIN, '/Users/test/bin/pi');
+  assert.equal(env.PATH, '/usr/bin');
+});
+
+test('spawnEnvForAgent expands a ~-prefixed PI_CODING_AGENT_DIR like the other config-dir keys', () => {
+  const env = spawnEnvForAgent(
+    'pi',
+    {
+      PATH: '/usr/bin',
+    },
+    {
+      PI_CODING_AGENT_DIR: '~/.pi-isolated/agent',
+    },
+  );
+
+  assert.equal(env.PI_CODING_AGENT_DIR, join(homedir(), '.pi-isolated', 'agent'));
 });

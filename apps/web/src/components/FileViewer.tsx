@@ -1,3 +1,5 @@
+import { useExperienceError } from '../observability/use-experience-error';
+import { daemonErrorCodeProp, failureDetailProps } from '../analytics/failure-detail';
 import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent as ReactClipboardEvent, type CSSProperties, type DragEvent as ReactDragEvent, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import type { ArtifactExportFormat } from '../runtime/chat/artifact-export';
 import { AnchoredMenuShell } from './chat/AnchoredMenuShell';
@@ -243,6 +245,11 @@ import { projectIsSharedWithWorkspace } from '../collab/project-shared-status';
 import { HandoffButton } from './HandoffButton';
 import { SocialShareGrid } from './SocialShareGrid';
 import { Toast } from './Toast';
+import {
+  LocalizedExportError,
+  exportFailureToast,
+  genericExportFailedToast,
+} from './export-failure-toast';
 import {
   PreviewDrawOverlay,
   ANNOTATION_EVENT,
@@ -2024,6 +2031,7 @@ export function LiveArtifactViewer({
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
+  useExperienceError(refreshError, 'live_artifact_refresh', projectId);
   const [refreshSuccess, setRefreshSuccess] = useState<string | null>(null);
   const [refreshEvents, setRefreshEvents] = useState<LiveArtifactRefreshEvent[]>([]);
   const [refreshHistory, setRefreshHistory] = useState<LiveArtifactRefreshLogEntry[]>([]);
@@ -3254,12 +3262,14 @@ function isHtmlVersionableFile(file: ProjectFile): boolean {
 }
 
 function fileVersionSourceLabel(version: ProjectFileVersion, t: TranslateFn): string {
+  if (version.source === 'sync') return t('fileViewer.versions.sourceSync');
   if (version.source === 'manual') return t('fileViewer.versions.sourceManual');
   if (version.source === 'restore') return t('fileViewer.versions.sourceRestore');
   return t('fileViewer.versions.sourceAi');
 }
 
 function fileVersionSourceClassName(version: ProjectFileVersion): string {
+  if (version.source === 'sync') return 'sync';
   if (version.source === 'manual') return 'manual';
   if (version.source === 'restore') return 'restore';
   return 'ai';
@@ -3268,6 +3278,7 @@ function fileVersionSourceClassName(version: ProjectFileVersion): string {
 // Any unknown/legacy source value counts as 'ai', matching the label and
 // class-name fallbacks above.
 function fileVersionSourceToTracking(version: ProjectFileVersion): TrackingFileVersionSource {
+  if (version.source === 'sync') return 'sync';
   if (version.source === 'manual') return 'manual';
   if (version.source === 'restore') return 'restore';
   return 'ai';
@@ -3333,6 +3344,7 @@ type HtmlVersionExportContext = {
 
 type ExportToastState = {
   message: string;
+  details?: string | null;
   tone: 'default' | 'success' | 'error' | 'loading';
 };
 
@@ -3408,6 +3420,7 @@ function FileVersionManagerModal({
   const [loading, setLoading] = useState(true);
   const [loadingContent, setLoadingContent] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  useExperienceError(error, 'file_version_operation', projectId);
   const [restoring, setRestoring] = useState(false);
   const [search, setSearch] = useState('');
   const [confirmRestore, setConfirmRestore] = useState(false);
@@ -3758,7 +3771,7 @@ function FileVersionManagerModal({
     setVersionExportToast({ message: t('fileViewer.exportingProgress'), tone: 'loading' });
     const content = await ensureVersionContent(version);
     if (!content) {
-      setVersionExportToast({ message: t('fileViewer.exportFailed'), tone: 'error' });
+      setVersionExportToast(genericExportFailedToast(t));
       return;
     }
     try {
@@ -3776,8 +3789,7 @@ function FileVersionManagerModal({
       }
       setVersionExportToast({ message: t('fileViewer.exportDone'), tone: 'success' });
     } catch (err) {
-      const message = err instanceof Error && err.message ? err.message : t('fileViewer.exportFailed');
-      setVersionExportToast({ message, tone: 'error' });
+      setVersionExportToast(exportFailureToast(err, t));
     }
   }
 
@@ -3802,7 +3814,7 @@ function FileVersionManagerModal({
     setVersionExportToast({ message: t('fileViewer.exportingProgress'), tone: 'loading' });
     const content = await ensureVersionContent(version);
     if (!content) {
-      setVersionExportToast({ message: t('fileViewer.exportFailed'), tone: 'error' });
+      setVersionExportToast(genericExportFailedToast(t));
       return;
     }
     const context: HtmlVersionExportContext = {
@@ -3822,7 +3834,7 @@ function FileVersionManagerModal({
     }
     await runVersionExport(version, async (content, title) => {
       const snapshot = await captureVersionPreviewSnapshot({ full: true });
-      if (!snapshot) throw new Error(t('fileViewer.exportFailed'));
+      if (!snapshot) throw new Error('version PDF snapshot unavailable');
       await exportSnapshotAsPdf(snapshot, title);
     });
   }
@@ -3830,9 +3842,9 @@ function FileVersionManagerModal({
   async function exportVersionImage(version: ProjectFileVersion, format: ImageExportFormat) {
     await runVersionExport(version, async (content, title) => {
       const snapshot = await captureVersionPreviewSnapshot({ full: true });
-      if (!snapshot) throw new Error(t('fileViewer.exportImageFailed'));
+      if (!snapshot) throw new LocalizedExportError(t('fileViewer.exportImageFailed'));
       const blob = await imageDataUrlToBlob(snapshot.dataUrl, format);
-      if (blob.size <= 0) throw new Error(t('fileViewer.exportImageFailed'));
+      if (blob.size <= 0) throw new LocalizedExportError(t('fileViewer.exportImageFailed'));
       const target = await prepareImageExportTarget(title, format, { useNativePicker: false });
       if (!target) return 'cancelled';
       if (target.method === 'download' && format === 'png') {
@@ -4326,6 +4338,7 @@ function FileVersionManagerModal({
         <Toast
           className="file-version-export-toast"
           message={visibleExportToast.message}
+          details={visibleExportToast.details}
           tone={visibleExportToast.tone}
           role={visibleExportToast.tone === 'error' ? 'alert' : 'status'}
           ttlMs={visibleExportToast.tone === 'loading' ? 60000 : 2200}
@@ -6624,8 +6637,10 @@ function ReactComponentViewer({
   const firePublishResult = (
     outcome: Pick<
       ArtifactPublishResultProps,
-      'action' | 'result' | 'error_code' | 'publish_duration_ms'
+      | 'action' | 'result' | 'error_code' | 'publish_duration_ms' | 'daemon_error_code'
+      | 'failed_stage' | 'failure_reason' | 'upstream_status' | 'upstream_error_code'
     >,
+    requestId?: string,
   ) => {
     // Read the live ref, not the captured prop: a request can start while this
     // viewer is active and settle after the user switches tabs.
@@ -6635,7 +6650,7 @@ function ReactComponentViewer({
       area: 'share_option_popover',
       ...outcome,
       ...publishTrackingIdentity(),
-    });
+    }, requestId ? { requestId } : undefined);
   };
 
   async function publishCurrentFilePublic() {
@@ -6645,16 +6660,22 @@ function ReactComponentViewer({
     const requestSeq = ++publicFileRequestSeqRef.current;
     firePublishFlowClick('publish_file');
     const publishStarted = performance.now();
+    const publishRequestId = analytics.newRequestId();
     setPublishingPublicFile(true);
     setPublishLinkFeedback(null);
     setPublishFailureKey(null);
     try {
-      const response = await publishProjectFilePublic(requestProjectId, requestFileName, workspaceContext);
+      const response = await publishProjectFilePublic(
+        requestProjectId,
+        requestFileName,
+        workspaceContext,
+        publishRequestId,
+      );
       firePublishResult({
         action: 'publish',
         result: 'success',
         publish_duration_ms: Math.round(performance.now() - publishStarted),
-      });
+      }, publishRequestId);
       const current = publicFileIdentityRef.current;
       if (
         publicFileRequestSeqRef.current !== requestSeq ||
@@ -6673,7 +6694,9 @@ function ReactComponentViewer({
         result: 'failed',
         error_code: publishErrorCode(error),
         publish_duration_ms: Math.round(performance.now() - publishStarted),
-      });
+        ...daemonErrorCodeProp(error),
+        ...failureDetailProps(error),
+      }, publishRequestId);
       if (publicFileRequestSeqRef.current === requestSeq) {
         if (recoveryPublication) {
           setPublishedFileUrl(recoveryPublication.url);
@@ -6697,16 +6720,23 @@ function ReactComponentViewer({
     const requestSlug = publishedFileSlug;
     const requestSeq = ++publicFileRequestSeqRef.current;
     const unpublishStarted = performance.now();
+    const unpublishRequestId = analytics.newRequestId();
     setPublishingPublicFile(true);
     setPublishLinkFeedback(null);
     setPublishFailureKey(null);
     try {
-      await unpublishProjectFilePublic(requestProjectId, requestFileName, requestSlug, workspaceContext);
+      await unpublishProjectFilePublic(
+        requestProjectId,
+        requestFileName,
+        requestSlug,
+        workspaceContext,
+        unpublishRequestId,
+      );
       firePublishResult({
         action: 'unpublish',
         result: 'success',
         publish_duration_ms: Math.round(performance.now() - unpublishStarted),
-      });
+      }, unpublishRequestId);
       const current = publicFileIdentityRef.current;
       if (
         publicFileRequestSeqRef.current !== requestSeq ||
@@ -6724,7 +6754,9 @@ function ReactComponentViewer({
         result: 'failed',
         error_code: publishErrorCode(error),
         publish_duration_ms: Math.round(performance.now() - unpublishStarted),
-      });
+        ...daemonErrorCodeProp(error),
+        ...failureDetailProps(error),
+      }, unpublishRequestId);
       if (publicFileRequestSeqRef.current === requestSeq) {
         setPublishLinkFeedback('failed');
         setPublishFailureKey(publicFilePublishFailureKey(error));
@@ -7579,8 +7611,7 @@ function HtmlViewer({
     }
     const failToast = (err?: unknown) => {
       stopTicker();
-      const message = err instanceof Error && err.message ? err.message : t('fileViewer.exportFailed');
-      if (toastFormats.has(format)) setExportToast({ message, tone: 'error' });
+      if (toastFormats.has(format)) setExportToast(exportFailureToast(err, t));
     };
     try {
       const out = fn();
@@ -7901,6 +7932,7 @@ function HtmlViewer({
   }, [fileViewportKey]);
   const [templateDescription, setTemplateDescription] = useState('');
   const [templateSaveError, setTemplateSaveError] = useState<string | null>(null);
+  useExperienceError(templateSaveError, 'template_save', projectId);
   const [deployment, setDeployment] = useState<WebDeploymentInfo | null>(null);
   const [deploymentsByProvider, setDeploymentsByProvider] = useState<Partial<Record<WebDeployProviderId, WebDeploymentInfo>>>({});
   const deploymentsLoadSeqRef = useRef(0);
@@ -7915,6 +7947,7 @@ function HtmlViewer({
   const [deployPhase, setDeployPhase] = useState<'idle' | 'deploying' | 'preparing-link'>('idle');
   const [savingDeployConfig, setSavingDeployConfig] = useState(false);
   const [deployError, setDeployError] = useState<string | null>(null);
+  useExperienceError(deployError, 'artifact_deploy', projectId);
   const [deployResult, setDeployResult] = useState<WebDeployProjectFileResponse | null>(null);
   const [copiedDeployLink, setCopiedDeployLink] = useState<string | null>(null);
   const [deployProviderId, setDeployProviderId] = useState<WebDeployProviderId>(DEFAULT_DEPLOY_PROVIDER_ID);
@@ -8053,8 +8086,10 @@ function HtmlViewer({
   const firePublishResult = (
     outcome: Pick<
       ArtifactPublishResultProps,
-      'action' | 'result' | 'error_code' | 'publish_duration_ms'
+      | 'action' | 'result' | 'error_code' | 'publish_duration_ms' | 'daemon_error_code'
+      | 'failed_stage' | 'failure_reason' | 'upstream_status' | 'upstream_error_code'
     >,
+    requestId?: string,
   ) => {
     // Read the live ref, not the captured prop: a publish/unpublish request can
     // start while this viewer is active and settle after the user switches tabs,
@@ -8065,7 +8100,7 @@ function HtmlViewer({
       area: 'share_option_popover',
       ...outcome,
       ...publishTrackingIdentity(),
-    });
+    }, requestId ? { requestId } : undefined);
   };
 
   async function publishCurrentFilePublic() {
@@ -8075,16 +8110,22 @@ function HtmlViewer({
     const requestSeq = ++publicFileRequestSeqRef.current;
     firePublishFlowClick('publish_file');
     const publishStarted = performance.now();
+    const publishRequestId = analytics.newRequestId();
     setPublishingPublicFile(true);
     setPublishLinkFeedback(null);
     setPublishFailureKey(null);
     try {
-      const response = await publishProjectFilePublic(requestProjectId, requestFileName, workspaceContext);
+      const response = await publishProjectFilePublic(
+        requestProjectId,
+        requestFileName,
+        workspaceContext,
+        publishRequestId,
+      );
       firePublishResult({
         action: 'publish',
         result: 'success',
         publish_duration_ms: Math.round(performance.now() - publishStarted),
-      });
+      }, publishRequestId);
       const current = publicFileIdentityRef.current;
       if (
         publicFileRequestSeqRef.current !== requestSeq ||
@@ -8103,7 +8144,9 @@ function HtmlViewer({
         result: 'failed',
         error_code: publishErrorCode(error),
         publish_duration_ms: Math.round(performance.now() - publishStarted),
-      });
+        ...daemonErrorCodeProp(error),
+        ...failureDetailProps(error),
+      }, publishRequestId);
       if (publicFileRequestSeqRef.current === requestSeq) {
         if (recoveryPublication) {
           setPublishedFileUrl(recoveryPublication.url);
@@ -8127,16 +8170,23 @@ function HtmlViewer({
     const requestSlug = publishedFileSlug;
     const requestSeq = ++publicFileRequestSeqRef.current;
     const unpublishStarted = performance.now();
+    const unpublishRequestId = analytics.newRequestId();
     setPublishingPublicFile(true);
     setPublishLinkFeedback(null);
     setPublishFailureKey(null);
     try {
-      await unpublishProjectFilePublic(requestProjectId, requestFileName, requestSlug, workspaceContext);
+      await unpublishProjectFilePublic(
+        requestProjectId,
+        requestFileName,
+        requestSlug,
+        workspaceContext,
+        unpublishRequestId,
+      );
       firePublishResult({
         action: 'unpublish',
         result: 'success',
         publish_duration_ms: Math.round(performance.now() - unpublishStarted),
-      });
+      }, unpublishRequestId);
       const current = publicFileIdentityRef.current;
       if (
         publicFileRequestSeqRef.current !== requestSeq ||
@@ -8154,7 +8204,9 @@ function HtmlViewer({
         result: 'failed',
         error_code: publishErrorCode(error),
         publish_duration_ms: Math.round(performance.now() - unpublishStarted),
-      });
+        ...daemonErrorCodeProp(error),
+        ...failureDetailProps(error),
+      }, unpublishRequestId);
       if (publicFileRequestSeqRef.current === requestSeq) {
         setPublishLinkFeedback('failed');
         setPublishFailureKey(publicFilePublishFailureKey(error));
@@ -8913,6 +8965,7 @@ function HtmlViewer({
   const [manualEditHistory, setManualEditHistory] = useState<ManualEditHistoryEntry[]>([]);
   const [manualEditUndone, setManualEditUndone] = useState<ManualEditHistoryEntry[]>([]);
   const [manualEditError, setManualEditError] = useState<string | null>(null);
+  useExperienceError(manualEditError, 'manual_edit', projectId);
   const [manualEditSaving, setManualEditSaving] = useState(false);
   const manualEditSavingRef = useRef(false);
   const manualEditPendingStyleRef = useRef<ManualEditPendingStyleSave | null>(null);
@@ -9069,6 +9122,7 @@ function HtmlViewer({
   const [savingInspect, setSavingInspect] = useState(false);
   const [inspectSavedAt, setInspectSavedAt] = useState<number | null>(null);
   const [inspectError, setInspectError] = useState<string | null>(null);
+  useExperienceError(inspectError, 'preview_inspect', projectId);
   const [queuedBoardNotes, setQueuedBoardNotes] = useState<string[]>([]);
   // Images attached to an element comment ("评论此元素"). Kept as raw Files
   // (uploaded on send) with object-URL thumbnails for preview/remove, mirroring
@@ -9096,6 +9150,7 @@ function HtmlViewer({
   const [imageExportContext, setImageExportContext] = useState<HtmlVersionExportContext | null>(null);
   const [imageExportFormat, setImageExportFormat] = useState<ImageExportFormat>('png');
   const [imageExportError, setImageExportError] = useState<string | null>(null);
+  useExperienceError(imageExportError, 'image_export', projectId);
   const [pptxExportModalOpen, setPptxExportModalOpen] = useState(false);
   // Ask the daemon whether it can render slides each time an export surface
   // opens, and let the answer live no longer than that surface. This is the
@@ -14323,6 +14378,7 @@ function HtmlViewer({
     // accepts the publish, failed on any hard error / missing config. This is
     // distinct from the share-popover "opened" signal (artifact_export_result).
     const deployStarted = performance.now();
+    const deployRequestId = analytics.newRequestId();
     const providerForTracking: TrackingDeployProvider =
       deployProviderId === CLOUDFLARE_PAGES_PROVIDER_ID ? 'cloudflare_pages' : 'vercel';
     const firstConfigure = !deployConfig?.configured;
@@ -14330,6 +14386,7 @@ function HtmlViewer({
     const fireDeployResult = (
       result: 'success' | 'failed' | 'cancelled',
       errorCode?: string,
+      error?: unknown,
     ) => {
       trackArtifactDeployResult(analytics.track, {
         page_name: 'artifact',
@@ -14344,7 +14401,8 @@ function HtmlViewer({
         deploy_duration_ms: Math.round(performance.now() - deployStarted),
         project_id: projectId,
         project_kind: projectKind,
-      });
+        ...failureDetailProps(error),
+      }, { requestId: deployRequestId });
     };
     try {
       const cloudflarePagesSelection = buildCloudflarePagesDeploySelection();
@@ -14385,6 +14443,7 @@ function HtmlViewer({
         cloudflarePagesSelection,
         deployProviderId === CLOUDFLARE_PAGES_PROVIDER_ID ? deployTarget : undefined,
         workspaceContext,
+        deployRequestId,
       );
       setDeploymentsByProvider((current) => ({
         ...current,
@@ -14420,6 +14479,7 @@ function HtmlViewer({
       fireDeployResult(
         'failed',
         tokenRequired ? 'CONFIG_REQUIRED' : deployErrorCode(err),
+        err,
       );
     } finally {
       setDeploying(false);
@@ -15656,8 +15716,7 @@ function HtmlViewer({
       });
     } catch (err) {
       console.warn('[exportAsImage] failed to save snapshot:', err);
-      const message = err instanceof Error && err.message ? err.message : t('fileViewer.exportImageFailed');
-      setExportToast({ message, tone: 'error' });
+      setExportToast(exportFailureToast(err, t));
       fireImageExportResult('failed', exportErrorCode(err));
     } finally {
       imageExportInFlightRef.current = false;
@@ -17707,6 +17766,7 @@ function HtmlViewer({
                 ? createPortal(
                     <Toast
                       message={exportToast.message}
+                      details={exportToast.details}
                       tone={exportToast.tone}
                       role={exportToast.tone === 'error' ? 'alert' : 'status'}
                       ttlMs={exportToast.tone === 'loading' ? 60000 : 2200}
@@ -18068,12 +18128,13 @@ function HtmlViewer({
                       // reach at all (transient, says nothing about support).
                       // Telling a user with a dead daemon that the feature is
                       // "not available here" sends them to the wrong problem.
-                      throw new Error(
-                        'error' in res
-                          ? res.error
-                          : res.reason === 'unreachable'
-                            ? t('fileViewer.exportDaemonUnreachable')
-                            : t('fileViewer.exportPptxNa'),
+                      // A raw renderer/daemon `error` string stays out of the UI
+                      // (generic S26a copy); the two localized reasons pass through.
+                      if ('error' in res) throw new Error(res.error);
+                      throw new LocalizedExportError(
+                        res.reason === 'unreachable'
+                          ? t('fileViewer.exportDaemonUnreachable')
+                          : t('fileViewer.exportPptxNa'),
                       );
                     }
                   });
@@ -18949,6 +19010,7 @@ export function SvgViewer({
   const [source, setSource] = useState<string | null>(initialSource ?? null);
   const [loadingSource, setLoadingSource] = useState(false);
   const [sourceError, setSourceError] = useState(false);
+  useExperienceError(sourceError, 'file_source_load', projectId);
   const [reloadKey, setReloadKey] = useState(0);
   const url = appendResourceQuery(
     projectFileUrl(projectId, file.name, workspaceContext),
